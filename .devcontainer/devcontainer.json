@@ -1,0 +1,6 @@
+{
+  "tasks": {
+    "build": "pip install -r requirements.txt && cd ./frontend && npm install",
+    "launch": "cd backend && python -m autogpt && cd ../frontend && npm start"
+  }
+}
