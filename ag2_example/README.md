@@ -75,3 +75,25 @@ print(response.choices[0].message.content)
   ```bash
   npx @modelcontextprotocol/inspector podman run --rm -i --env-file ag2_example/.env ghcr.io/nguyenvanduocit/jira-mcp:latest
   ```
+
+  Save the inspector's JSON `clientConfig` (or the spec emitted by your existing runtime tooling) to
+  a file and pass it to the demo with `--jira-spec path/to/spec.json`. When a spec is supplied the
+  agent skips launching a container and instead connects to the running MCP server described by the
+  JSON payload. The format mirrors the arguments accepted by `_build_jira_toolkit`; for example:
+
+  ```json
+  {
+    "name": "jira",
+    "command": "podman",
+    "args": ["run", "--rm", "-i", "--env-file", "ag2_example/.env", "ghcr.io/nguyenvanduocit/jira-mcp:latest"],
+    "env": {
+      "JIRA_BASE_URL": "https://your-instance.atlassian.net",
+      "JIRA_EMAIL": "you@example.com",
+      "JIRA_API_TOKEN": "your_api_token"
+    }
+  }
+  ```
+
+  Specifications exported by other MCP tooling—such as the inspector's WebSocket client config—can
+  be provided verbatim as long as they decode to a JSON object. The loader automatically adapts the
+  payload to the installed AG2/AutoGen MCP API.

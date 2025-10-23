@@ -57,7 +57,9 @@ of them.
    ```
 
    The script constructs a `ConversableAgent` from AG2, attaches the Jira MCP toolkit, forwards your
-   prompt to Hugging Face's OpenAI-compatible endpoint, and prints the model's reply.
+   prompt to Hugging Face's OpenAI-compatible endpoint, and prints the model's reply. If you prefer
+   to run the Jira MCP server independently (for example while debugging with the MCP Inspector),
+   export the server specification to JSON and point the demo at it with `--jira-spec path/to/spec.json`.
 
 ## Project Structure
 

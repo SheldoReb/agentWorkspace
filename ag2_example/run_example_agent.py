@@ -9,28 +9,58 @@ the conversation requires project-tracking context.
 from __future__ import annotations
 
 import argparse
+import importlib
+import inspect
+import json
 import os
 import pathlib
 import sys
-from typing import Any, Mapping
+from typing import Any, Mapping, MutableMapping
 
 from autogen import ConversableAgent
 
-try:  # Prefer the autogen-agentchat distribution when available.
-    from autogen.agentchat.contrib.mcp import MCPToolkit
-except ModuleNotFoundError:  # pragma: no cover - import path varies per install
-    try:
-        from ag2.autogen.mcp import MCPToolkit
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "MCP toolkit helpers are unavailable. Install either `autogen-agentchat[mcp]>=0.2.0` "
-            "or the AG2 package that exposes `ag2.autogen.mcp`."
-        ) from exc
+
+def _resolve_mcp_toolkit() -> type:
+    """Return the MCP toolkit class regardless of installation layout."""
+
+    candidates = (
+        ("autogen.agentchat.contrib.mcp", "MCPToolkit"),
+        ("autogen.agentchat.mcp", "MCPToolkit"),
+        ("ag2.autogen.mcp", "MCPToolkit"),
+        ("ag2.autogen.mcp.toolkit", "MCPToolkit"),
+        ("ag2.autogen.agentchat.contrib.mcp", "MCPToolkit"),
+    )
+
+    errors: list[str] = []
+    for module_name, attr_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:  # pragma: no cover - layout specific
+            errors.append(f"{module_name}: {exc}")
+            continue
+        except ImportError as exc:  # pragma: no cover - attr missing on package
+            errors.append(f"{module_name}: {exc}")
+            continue
+
+        try:
+            return getattr(module, attr_name)
+        except AttributeError as exc:
+            errors.append(f"{module_name}.{attr_name}: {exc}")
+            continue
+
+    raise ModuleNotFoundError(
+        "Unable to locate MCPToolkit. Install `autogen-agentchat[mcp]>=0.2.0` or an AG2 build that "
+        "exposes the MCP helpers. Tried: " + ", ".join(errors)
+    )
+
+
+MCPToolkit = _resolve_mcp_toolkit()
 
 
 DEFAULT_PROMPT = "Summarise README.md and provide a short bulleted outline."
 DEFAULT_JIRA_IMAGE = "ghcr.io/nguyenvanduocit/jira-mcp:latest"
 DEFAULT_JIRA_RUNTIME = "podman"
+DEFAULT_JIRA_NAME = "jira"
 
 
 def _build_llm_config() -> dict[str, Any]:
@@ -77,30 +107,83 @@ def _load_env_file(env_file: pathlib.Path) -> Mapping[str, str]:
     return env
 
 
+def _load_tool_spec(spec_path: pathlib.Path) -> MutableMapping[str, Any]:
+    """Load a JSON MCP specification from ``spec_path``."""
+
+    if not spec_path.exists():
+        raise RuntimeError(f"Unable to locate Jira MCP spec at {spec_path!s}.")
+
+    try:
+        loaded = json.loads(spec_path.read_text())
+    except json.JSONDecodeError as exc:  # pragma: no cover - validation branch
+        raise RuntimeError(f"Failed to parse MCP spec JSON: {exc}") from exc
+
+    if not isinstance(loaded, MutableMapping):
+        raise RuntimeError("MCP spec must decode to a JSON object.")
+
+    return loaded
+
+
+def _instantiate_toolkit(spec: MutableMapping[str, Any]) -> MCPToolkit:
+    """Instantiate ``MCPToolkit`` from ``spec`` across API variants."""
+
+    if hasattr(MCPToolkit, "from_spec") and callable(getattr(MCPToolkit, "from_spec")):
+        return MCPToolkit.from_spec(spec)  # type: ignore[attr-defined]
+
+    if hasattr(MCPToolkit, "from_dict") and callable(getattr(MCPToolkit, "from_dict")):
+        return MCPToolkit.from_dict(spec)  # type: ignore[attr-defined]
+
+    try:
+        signature = inspect.signature(MCPToolkit)
+    except (TypeError, ValueError):  # pragma: no cover - builtins or C extensions
+        signature = None
+
+    if signature is not None:
+        parameters = signature.parameters
+
+        if "spec" in parameters:
+            name = spec.get("name", DEFAULT_JIRA_NAME)
+            payload = spec.get("spec")
+            if not isinstance(payload, MutableMapping):
+                payload = {key: value for key, value in spec.items() if key != "name"}
+            return MCPToolkit(name=name, spec=payload)  # type: ignore[call-arg]
+
+    return MCPToolkit(**spec)  # type: ignore[arg-type,call-arg]
+
+
 def _build_jira_toolkit(
     env_file: pathlib.Path,
     runtime: str,
     image: str,
+    spec_path: pathlib.Path | None,
 ) -> MCPToolkit:
     """Return an MCP toolkit definition that launches the Jira container on demand."""
+
+    if spec_path is not None:
+        spec = _load_tool_spec(spec_path)
+        spec.setdefault("name", DEFAULT_JIRA_NAME)
+        return _instantiate_toolkit(spec)
 
     env_overrides = _load_env_file(env_file)
     args: list[str] = ["run", "--rm", "-i", "--env-file", str(env_file), image]
 
-    spec = {
-        "name": "jira",
+    spec: MutableMapping[str, Any] = {
+        "name": DEFAULT_JIRA_NAME,
         "command": runtime,
         "args": args,
         "env": env_overrides,
     }
 
-    if hasattr(MCPToolkit, "from_spec"):
-        return MCPToolkit.from_spec(spec)  # type: ignore[attr-defined]
-
-    return MCPToolkit(**spec)  # type: ignore[arg-type,call-arg]
+    return _instantiate_toolkit(spec)
 
 
-def run_agent(prompt: str, jira_env: pathlib.Path, runtime: str, image: str) -> None:
+def run_agent(
+    prompt: str,
+    jira_env: pathlib.Path,
+    runtime: str,
+    image: str,
+    spec_path: pathlib.Path | None,
+) -> None:
     """Send ``prompt`` to the configured AG2 agent and print the response."""
 
     agent = ConversableAgent(
@@ -111,7 +194,7 @@ def run_agent(prompt: str, jira_env: pathlib.Path, runtime: str, image: str) -> 
         llm_config=_build_llm_config(),
     )
 
-    jira_toolkit = _build_jira_toolkit(jira_env, runtime, image)
+    jira_toolkit = _build_jira_toolkit(jira_env, runtime, image, spec_path)
     if hasattr(agent, "register_toolkit"):
         agent.register_toolkit(jira_toolkit)  # type: ignore[attr-defined]
     else:  # pragma: no cover - fallback for older AG2 builds
@@ -158,6 +241,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_JIRA_IMAGE,
         help="Container image that provides the Jira MCP server.",
     )
+    parser.add_argument(
+        "--jira-spec",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Optional path to a JSON MCP toolkit specification. When provided the script connects to the existing "
+            "server described by the spec instead of spawning the container runtime."
+        ),
+    )
     return parser
 
 
@@ -166,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        run_agent(args.prompt, args.jira_env, args.jira_runtime, args.jira_image)
+        run_agent(args.prompt, args.jira_env, args.jira_runtime, args.jira_image, args.jira_spec)
     except Exception as exc:  # noqa: BLE001 - surface rich error message
         parser.error(str(exc))
         return 1
