@@ -1,0 +1,68 @@
+schema_version: v1
+app:
+  name: markitdown-jira-sandbox
+  description: >-
+    Minimal AG2 application composed of a single autonomous agent that can execute code in Docker, interact with
+    the markItDown MCP server to convert documents to Markdown, and call a Jira MCP server for project updates.
+  model_providers:
+    huggingface-router:
+      type: openai-compatible
+      config:
+        base_url: https://router.huggingface.co/v1
+        api_key: ${HF_TOKEN}
+  default_model:
+    provider: huggingface-router
+    model: openai/gpt-oss-120b
+    parameters:
+      temperature: 0.2
+      max_output_tokens: 2048
+  tools:
+    docker-code-interpreter:
+      type: docker
+      config:
+        image: python:3.11-slim
+        workdir: /workspace
+        mount_repo: true
+        timeout: 120
+    markitdown:
+      type: mcp
+      config:
+        transport: stdio
+        command:
+          - python
+          - -m
+          - markitdown.server
+        args:
+          - --allowed-path
+          - ${REPO_ROOT}
+    jira:
+      type: mcp
+      config:
+        transport: stdio
+        command:
+          - podman
+        args:
+          - run
+          - --rm
+          - -i
+          - --env-file
+          - ${JIRA_MCP_ENV_FILE}
+          - ghcr.io/nguyenvanduocit/jira-mcp:latest
+  agents:
+    - name: document_transformer
+      system_prompt: >-
+        You are a precise technical assistant. When you need to run code, use the Docker code interpreter tool.
+        When you need to normalise or convert documents, use the markItDown MCP server. When you need details
+        about Jira issues or projects, call the Jira MCP server. Always explain what you are doing and provide
+        Markdown output where appropriate.
+      model:
+        provider: huggingface-router
+        model: openai/gpt-oss-120b
+        parameters:
+          temperature: 0.1
+          max_output_tokens: 2048
+      tools:
+        - docker-code-interpreter
+        - markitdown
+        - jira
+      allow_code_execution: true

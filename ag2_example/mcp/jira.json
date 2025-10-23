@@ -1,0 +1,20 @@
+{
+  "name": "jira",
+  "display_name": "Jira MCP Server",
+  "description": "Launch the Jira MCP container via Podman so AG2 agents can query Jira issues and projects.",
+  "transport": {
+    "type": "stdio"
+  },
+  "command": [
+    "podman"
+  ],
+  "args": [
+    "run",
+    "--rm",
+    "-i",
+    "--env-file",
+    "${JIRA_MCP_ENV_FILE}",
+    "ghcr.io/nguyenvanduocit/jira-mcp:latest"
+  ],
+  "env": {}
+}
