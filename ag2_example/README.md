@@ -28,23 +28,35 @@ ag2_example/
    pip install -r requirements.txt
    ```
 
-3. Provide an API token for the Hugging Face Inference Router via the `HF_TOKEN` environment variable. You can generate a token from the [Hugging Face settings page](https://huggingface.co/settings/tokens).
+3. Install the AG2 runtime. Until a PyPI distribution is available you can install it directly from the upstream repository:
 
-4. Ensure Docker is running locally so the AG2 Docker tool can start ephemeral containers.
+   ```bash
+   pip install "ag2 @ git+https://github.com/ag2ai/ag2.git"
+   ```
 
-5. Install the `markitdown` MCP server. The server is distributed as a Python package so it can be installed directly:
+   Confirm that the package was installed correctly:
+
+   ```bash
+   python -c "import ag2; print(getattr(ag2, '__version__', 'unknown'))"
+   ```
+
+4. Provide an API token for the Hugging Face Inference Router via the `HF_TOKEN` environment variable. You can generate a token from the [Hugging Face settings page](https://huggingface.co/settings/tokens).
+
+5. Ensure Docker is running locally so the AG2 Docker tool can start ephemeral containers.
+
+6. Install the `markitdown` MCP server. The server is distributed as a Python package so it can be installed directly:
 
    ```bash
    pip install markitdown
    ```
 
-6. Install [Podman](https://podman.io/) (or ensure it is already available). The Jira MCP server is distributed as a container
+7. Install [Podman](https://podman.io/) (or ensure it is already available). The Jira MCP server is distributed as a container
    image and the AG2 configuration shells out to Podman to start it.
 
-7. Provide Jira credentials. Copy `ag2_example/.env.jira.example` to `ag2_example/.env.jira` and populate the variables as
+8. Provide Jira credentials. Copy `ag2_example/.env.jira.example` to `ag2_example/.env.jira` and populate the variables as
    documented by the Jira MCP server, or point the `JIRA_MCP_ENV_FILE` environment variable to an existing credentials file.
 
-8. (Optional) Verify that your Hugging Face token works by issuing a simple chat completion request against the
+9. (Optional) Verify that your Hugging Face token works by issuing a simple chat completion request against the
    `openai/gpt-oss-120b` model:
 
    ```python

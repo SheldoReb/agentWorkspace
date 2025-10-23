@@ -1,4 +1,4 @@
-ag2>=0.1.0
+# Core Python dependencies for the AG2 example. Install AG2 itself separately as described in the README.
 openai>=1.40.0
 markitdown>=0.2.0
 pyyaml>=6.0.1

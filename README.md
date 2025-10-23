@@ -25,8 +25,23 @@ In addition to the AG2 example, the repository still provides a lightweight Flas
 
 2. **Install dependencies**
 
+   Install the shared Python dependencies (excluding AG2 itself):
+
    ```bash
    pip install -r requirements.txt
+   ```
+
+   Then install the AG2 runtime. The project currently tracks the upstream Git repository because AG2 has not yet been
+   published to PyPI. You can install the latest release with:
+
+   ```bash
+   pip install "ag2 @ git+https://github.com/ag2ai/ag2.git"
+   ```
+
+   Verify the installation before proceeding:
+
+   ```bash
+   python -c "import ag2; print(getattr(ag2, '__version__', 'unknown'))"
    ```
 
 3. **Provide credentials for the Hugging Face Inference Router**

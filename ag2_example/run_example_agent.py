@@ -13,7 +13,11 @@ models, or MCP integrations.
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.util
+import inspect
 import os
+import pkgutil
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -34,10 +38,19 @@ def _load_app_builder() -> Callable[[dict[str, Any]], Any]:
     ``ag2.runtime.App`` depending on the installed version.
     """
 
+    ag2_spec = importlib.util.find_spec("ag2")
+    if ag2_spec is None:
+        raise ImportError(
+            "AG2 is not installed. Install it by following the official instructions at https://ag2.ai/docs "
+            "(for example \"pip install 'ag2 @ git+https://github.com/ag2ai/ag2.git'\") before running the example."
+        )
+
     candidate_paths = (
         "ag2.app.App",
         "ag2.runtime.App",
         "ag2.core.app.App",
+        "ag2.app.runtime.App",
+        "ag2.app.app.App",
     )
 
     for path in candidate_paths:
@@ -59,9 +72,46 @@ def _load_app_builder() -> Callable[[dict[str, Any]], Any]:
 
             return _create_app
 
+    def _candidate_from_obj(obj: Any) -> Callable[[dict[str, Any]], Any] | None:
+        if obj is None:
+            return None
+
+        if hasattr(obj, "from_dict") and callable(getattr(obj, "from_dict")):
+            return getattr(obj, "from_dict")
+
+        if inspect.isclass(obj):
+            return lambda config, cls=obj: cls(config)
+
+        if callable(obj):
+            return obj
+
+        return None
+
+    try:
+        ag2_package = importlib.import_module("ag2")
+    except ImportError as exc:  # pragma: no cover - guarded by find_spec above
+        raise ImportError("Failed to import the AG2 package even though it was detected.") from exc
+
+    for attr_name in ("App", "create_app", "build_app"):
+        builder = _candidate_from_obj(getattr(ag2_package, attr_name, None))
+        if builder is not None:
+            return builder
+
+    if getattr(ag2_package, "__path__", None):
+        for module_info in pkgutil.walk_packages(ag2_package.__path__, ag2_package.__name__ + "."):
+            try:
+                module = importlib.import_module(module_info.name)
+            except Exception:  # pragma: no cover - best effort discovery for evolving APIs
+                continue
+
+            for attr_name in ("App", "Application", "AG2App", "create_app", "build_app"):
+                builder = _candidate_from_obj(getattr(module, attr_name, None))
+                if builder is not None:
+                    return builder
+
     raise ImportError(
-        "Could not locate the AG2 application entry point. Please ensure the 'ag2' package is installed "
-        "and provides one of: ag2.app.App, ag2.runtime.App, ag2.core.app.App."
+        "Could not locate the AG2 application entry point. Confirm that your installed AG2 version exposes "
+        "an App builder (for example ag2.app.App)."
     )
 
 
