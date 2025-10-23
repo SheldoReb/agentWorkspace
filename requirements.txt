@@ -1,1 +1,3 @@
-autogpt==0.0.1.dev0
+# Python dependencies for the AG2 example with Jira MCP tooling.
+autogen-agentchat[mcp]>=0.2.0
+openai>=1.40.0

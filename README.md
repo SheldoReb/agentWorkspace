@@ -1,58 +1,71 @@
 # agentWorkspace
 
-## Project Description
+## Overview
 
-This project aims to set up example agents, frontend, and backend using the Auto-GPT framework. The purpose is to demonstrate how to integrate and use Auto-GPT for various applications.
+This repository demonstrates a lightweight integration of the [AG2 (AutoGen)](https://ag2.ai/) agent
+framework. The `ag2_example` folder contains a single-file script that:
 
-## Setting up the Auto-GPT Framework
+* calls the Hugging Face hosted `openai/gpt-oss-120b` model through the OpenAI compatible API,
+* launches the Jira Model Context Protocol (MCP) container so the assistant can reason over Jira
+  data, and
+* prints the model's response directly to your terminal.
 
-1. Clone the Auto-GPT repository:
+A minimal Flask backend and static frontend scaffold remain available should you want to build on top
+of them.
+
+## Quick Start
+
+1. **Clone the repository and create a virtual environment**
+
    ```bash
-   git clone https://github.com/Significant-Gravitas/AutoGPT.git
-   cd AutoGPT
+   git clone <repo-url>
+   cd agentWorkspace
+   python -m venv .venv
+   source .venv/bin/activate
    ```
 
-2. Install the required dependencies:
+2. **Install dependencies**
+
+   Install the Python packages required by the AG2 example (including the MCP extras):
+
    ```bash
    pip install -r requirements.txt
    ```
 
-3. Set up the environment variables:
+3. **Provide credentials for external services**
+
+   * Export a Hugging Face token so the assistant can access the inference router:
+
+     ```bash
+     export HF_TOKEN="hf_your_token_here"
+     ```
+
+   * Copy the Jira MCP template and fill in the required fields:
+
+     ```bash
+     cp ag2_example/jira.env.example ag2_example/.env
+     # Populate JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN
+     ```
+
+4. **Run the AG2 example agent**
+
    ```bash
-   cp .env.template .env
-   # Edit the .env file with your preferred settings
+   python ag2_example/run_example_agent.py "Summarise README.md and provide a short bulleted outline."
    ```
 
-4. Run the Auto-GPT framework:
-   ```bash
-   python -m autogpt
-   ```
+   The script constructs a `ConversableAgent` from AG2, attaches the Jira MCP toolkit, forwards your
+   prompt to Hugging Face's OpenAI-compatible endpoint, and prints the model's reply.
 
-## Using Agent Blocks within the Framework
+## Project Structure
 
-1. Create a new agent block:
-   ```python
-   from autogpt.agent import Agent
+```
+backend/          # Flask microservice used by the demo
+frontend/         # Static frontend assets
+ag2_example/      # Minimal AG2 example script and documentation
+requirements.txt  # Python dependencies shared across the project
+```
 
-   class MyAgent(Agent):
-       def __init__(self, name):
-           super().__init__(name)
+## Additional Resources
 
-       def run(self):
-           # Define the agent's behavior here
-           pass
-   ```
-
-2. Add the agent block to the framework:
-   ```python
-   from autogpt.framework import Framework
-
-   framework = Framework()
-   my_agent = MyAgent("MyAgent")
-   framework.add_agent(my_agent)
-   framework.run()
-   ```
-
-## Auto-GPT Documentation
-
-For more information, please refer to the [Auto-GPT documentation](https://github.com/Significant-Gravitas/AutoGPT).
+* [AG2 documentation](https://ag2.ai/)
+* [Hugging Face Inference Router](https://huggingface.co/inference-api)
