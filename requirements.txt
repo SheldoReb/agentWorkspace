@@ -1,1 +1,5 @@
-autogpt==0.0.1.dev0
+ag2>=0.1.0
+openai>=1.40.0
+markitdown>=0.2.0
+pyyaml>=6.0.1
+docker>=7.0.0

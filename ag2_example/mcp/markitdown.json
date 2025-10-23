@@ -1,0 +1,18 @@
+{
+  "name": "markitdown",
+  "display_name": "markItDown MCP Server",
+  "description": "Expose markItDown document conversion capabilities to AG2 agents via the MCP standard interface.",
+  "transport": {
+    "type": "stdio"
+  },
+  "command": [
+    "python",
+    "-m",
+    "markitdown.server"
+  ],
+  "args": [
+    "--allowed-path",
+    "${REPO_ROOT}"
+  ],
+  "env": {}
+}
