@@ -16,13 +16,16 @@ from typing import Any, Mapping
 
 from autogen import ConversableAgent
 
-try:  # AG2 provides MCP helpers starting from autogen-agentchat 0.2.0.
+try:  # Prefer the autogen-agentchat distribution when available.
     from autogen.agentchat.contrib.mcp import MCPToolkit
-except ModuleNotFoundError as exc:  # pragma: no cover - import path varies per install
-    raise ModuleNotFoundError(
-        "autogen.agentchat.contrib.mcp is unavailable. Install the MCP extra with "
-        "`pip install \"autogen-agentchat[mcp]>=0.2.0\"` to run this example."
-    ) from exc
+except ModuleNotFoundError:  # pragma: no cover - import path varies per install
+    try:
+        from ag2.autogen.mcp import MCPToolkit
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "MCP toolkit helpers are unavailable. Install either `autogen-agentchat[mcp]>=0.2.0` "
+            "or the AG2 package that exposes `ag2.autogen.mcp`."
+        ) from exc
 
 
 DEFAULT_PROMPT = "Summarise README.md and provide a short bulleted outline."

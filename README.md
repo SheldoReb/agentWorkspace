@@ -32,6 +32,9 @@ of them.
    pip install -r requirements.txt
    ```
 
+   If you prefer installing AG2 directly from its repository, ensure it exposes the
+   `ag2.autogen.mcp` module so the Jira toolkit import succeeds.
+
 3. **Provide credentials for external services**
 
    * Export a Hugging Face token so the assistant can access the inference router:

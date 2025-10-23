@@ -15,6 +15,9 @@ when the agent requests Jira-related context.
    pip install -r requirements.txt
    ```
 
+   Alternatively, installing AG2 from source works as long as the package exposes
+   `ag2.autogen.mcp` so the Jira toolkit can be imported.
+
 3. Export a Hugging Face API token (create one from the
    [Hugging Face settings page](https://huggingface.co/settings/tokens)):
 
