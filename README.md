@@ -1,58 +1,84 @@
 # agentWorkspace
 
-## Project Description
+## Overview
 
-This project aims to set up example agents, frontend, and backend using the Auto-GPT framework. The purpose is to demonstrate how to integrate and use Auto-GPT for various applications.
+This repository showcases a focused AutoGen setup that highlights how an assistant agent can combine
+multiple tools while running entirely inside a container. The example located in
+[`ag2_example/`](./ag2_example/):
 
-## Setting up the Auto-GPT Framework
+* routes language-model traffic to Hugging Face's OpenAI-compatible endpoint,
+* connects to a Jira Model Context Protocol (MCP) server as a stdio client so the agent can call Jira
+  tools,
+* exposes [markitdown](https://github.com/h2oai/markitdown) as a formatting helper, and
+* executes arbitrary Python code inside short-lived Docker containers to support iterative development.
 
-1. Clone the Auto-GPT repository:
+A Dockerfile is included so you can containerise the full runtime. Lightweight backend/frontend
+scaffolding is still present if you want to extend the project beyond the AutoGen demo.
+
+## Quick start
+
+1. **Create a virtual environment and install dependencies**
+
    ```bash
-   git clone https://github.com/Significant-Gravitas/AutoGPT.git
-   cd AutoGPT
-   ```
-
-2. Install the required dependencies:
-   ```bash
+   git clone <repo-url>
+   cd agentWorkspace
+   python -m venv .venv
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
-3. Set up the environment variables:
+2. **Configure credentials**
+
+   * Export a Hugging Face token so the assistant can reach the inference router:
+
+     ```bash
+     export HF_TOKEN="hf_your_token_here"
+     ```
+
+   * Copy the Jira MCP template and populate the required environment variables:
+
+     ```bash
+     cp ag2_example/jira.env.example ag2_example/.env
+     # Populate JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN
+     ```
+
+3. **Run the AutoGen agent**
+
    ```bash
-   cp .env.template .env
-   # Edit the .env file with your preferred settings
+   python ag2_example/run_example_agent.py --max-turns 8 "Summarise README.md in bullet points."
    ```
 
-4. Run the Auto-GPT framework:
+   The agent registers three tools—`jira_call_tool`, `render_with_markitdown`, and `execute_python`—and
+   decides when to invoke each one while working towards a final answer. Jira tools can also be supplied
+   via a JSON spec using `--jira-spec path/to/spec.json`.
+
+4. **Containerised workflow (optional)**
+
+   Build and run the provided Docker image when you want the entire stack to execute inside a
+   container. Mount the Jira environment file and expose your host's container runtime so nested code
+   execution can spawn additional containers:
+
    ```bash
-   python -m autogpt
+   docker build -f ag2_example/Dockerfile -t ag2-autogen-agent .
+   docker run --rm -it \
+     -e HF_TOKEN=$HF_TOKEN \
+     --env-file ag2_example/.env \
+     -v $(pwd)/ag2_example/.env:/app/ag2_example/.env:ro \
+     -v /var/run/docker.sock:/var/run/docker.sock \
+     ag2-autogen-agent
    ```
 
-## Using Agent Blocks within the Framework
+## Project structure
 
-1. Create a new agent block:
-   ```python
-   from autogpt.agent import Agent
+```
+backend/          # Flask microservice scaffold (unused by the AutoGen demo)
+frontend/         # Static frontend starter
+ag2_example/      # AutoGen example, Dockerfile, and documentation
+requirements.txt  # Python dependencies shared across the project
+```
 
-   class MyAgent(Agent):
-       def __init__(self, name):
-           super().__init__(name)
+## Further reading
 
-       def run(self):
-           # Define the agent's behavior here
-           pass
-   ```
-
-2. Add the agent block to the framework:
-   ```python
-   from autogpt.framework import Framework
-
-   framework = Framework()
-   my_agent = MyAgent("MyAgent")
-   framework.add_agent(my_agent)
-   framework.run()
-   ```
-
-## Auto-GPT Documentation
-
-For more information, please refer to the [Auto-GPT documentation](https://github.com/Significant-Gravitas/AutoGPT).
+* [AutoGen documentation](https://microsoft.github.io/autogen/stable/)
+* [Model Context Protocol specification](https://modelcontextprotocol.io/)
+* [markitdown project](https://github.com/h2oai/markitdown)
