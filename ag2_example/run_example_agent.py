@@ -1,61 +1,26 @@
-"""AG2 (AutoGen) example that exposes the Jira MCP tool to the assistant agent.
+"""AG2 (AutoGen) example that exposes the Jira MCP server without the MCPToolkit.
 
-The script keeps the lightweight single-file entry point introduced earlier while
-restoring access to the Jira Model Context Protocol (MCP) server.  The assistant is
-backed by Hugging Face's OpenAI-compatible router and can call the MCP tool whenever
-the conversation requires project-tracking context.
+The script keeps the lightweight single-file entry point while talking to the Jira
+Model Context Protocol (MCP) server through a tiny JSON-RPC bridge instead of the
+`MCPToolkit` helpers.  The assistant still relies on Hugging Face's
+OpenAI-compatible router and calls the MCP server whenever the conversation
+requires project-tracking context.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
-import inspect
+import contextlib
 import json
 import os
 import pathlib
+import subprocess
 import sys
-from typing import Any, Mapping, MutableMapping
+import threading
+from collections import deque
+from typing import Any, Iterable, Mapping, MutableMapping
 
 from autogen import ConversableAgent
-
-
-def _resolve_mcp_toolkit() -> type:
-    """Return the MCP toolkit class regardless of installation layout."""
-
-    candidates = (
-        ("autogen.agentchat.contrib.mcp", "MCPToolkit"),
-        ("autogen.agentchat.mcp", "MCPToolkit"),
-        ("ag2.autogen.mcp", "MCPToolkit"),
-        ("ag2.autogen.mcp.toolkit", "MCPToolkit"),
-        ("ag2.autogen.agentchat.contrib.mcp", "MCPToolkit"),
-    )
-
-    errors: list[str] = []
-    for module_name, attr_name in candidates:
-        try:
-            module = importlib.import_module(module_name)
-        except ModuleNotFoundError as exc:  # pragma: no cover - layout specific
-            errors.append(f"{module_name}: {exc}")
-            continue
-        except ImportError as exc:  # pragma: no cover - attr missing on package
-            errors.append(f"{module_name}: {exc}")
-            continue
-
-        try:
-            return getattr(module, attr_name)
-        except AttributeError as exc:
-            errors.append(f"{module_name}.{attr_name}: {exc}")
-            continue
-
-    raise ModuleNotFoundError(
-        "Unable to locate MCPToolkit. Install `autogen-agentchat[mcp]>=0.2.0` or an AG2 build that "
-        "exposes the MCP helpers. Tried: " + ", ".join(errors)
-    )
-
-
-MCPToolkit = _resolve_mcp_toolkit()
-
 
 DEFAULT_PROMPT = "Summarise README.md and provide a short bulleted outline."
 DEFAULT_JIRA_IMAGE = "ghcr.io/nguyenvanduocit/jira-mcp:latest"
@@ -124,57 +89,361 @@ def _load_tool_spec(spec_path: pathlib.Path) -> MutableMapping[str, Any]:
     return loaded
 
 
-def _instantiate_toolkit(spec: MutableMapping[str, Any]) -> MCPToolkit:
-    """Instantiate ``MCPToolkit`` from ``spec`` across API variants."""
-
-    if hasattr(MCPToolkit, "from_spec") and callable(getattr(MCPToolkit, "from_spec")):
-        return MCPToolkit.from_spec(spec)  # type: ignore[attr-defined]
-
-    if hasattr(MCPToolkit, "from_dict") and callable(getattr(MCPToolkit, "from_dict")):
-        return MCPToolkit.from_dict(spec)  # type: ignore[attr-defined]
-
-    try:
-        signature = inspect.signature(MCPToolkit)
-    except (TypeError, ValueError):  # pragma: no cover - builtins or C extensions
-        signature = None
-
-    if signature is not None:
-        parameters = signature.parameters
-
-        if "spec" in parameters:
-            name = spec.get("name", DEFAULT_JIRA_NAME)
-            payload = spec.get("spec")
-            if not isinstance(payload, MutableMapping):
-                payload = {key: value for key, value in spec.items() if key != "name"}
-            return MCPToolkit(name=name, spec=payload)  # type: ignore[call-arg]
-
-    return MCPToolkit(**spec)  # type: ignore[arg-type,call-arg]
+class MCPClientError(RuntimeError):
+    """Raised when the Jira MCP client encounters an unrecoverable error."""
 
 
-def _build_jira_toolkit(
+class MCPStdioTransport:
+    """Minimal JSON-RPC transport that communicates with an MCP server over stdio."""
+
+    def __init__(
+        self,
+        command: str,
+        args: Iterable[str],
+        env: Mapping[str, str] | None,
+    ) -> None:
+        if not command:
+            raise MCPClientError("MCP transport requires a command to execute.")
+
+        merged_env = os.environ.copy()
+        if env:
+            merged_env.update({str(key): str(value) for key, value in env.items()})
+
+        self._process = subprocess.Popen(
+            [command, *list(args)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=merged_env,
+            text=False,
+            bufsize=0,
+        )
+        if self._process.stdin is None or self._process.stdout is None:
+            self.close()
+            raise MCPClientError("Failed to establish pipes for the MCP transport.")
+
+        self._stdin = self._process.stdin
+        self._stdout = self._process.stdout
+        self._stderr = self._process.stderr
+        self._lock = threading.Lock()
+        self._next_request_id = 0
+        self._stderr_tail: deque[str] = deque(maxlen=50)
+
+        if self._stderr is not None:
+            threading.Thread(target=self._drain_stderr, daemon=True).start()
+
+    # ------------------------------------------------------------------ utils
+    def _ensure_alive(self) -> None:
+        if self._process.poll() is not None:
+            stderr_output = "\n".join(self._stderr_tail)
+            if not stderr_output:
+                stderr_output = "<no stderr output>"
+            raise MCPClientError(
+                "Jira MCP process exited unexpectedly. Last stderr output:\n" + stderr_output
+            )
+
+    def _drain_stderr(self) -> None:  # pragma: no cover - diagnostic helper
+        assert self._stderr is not None
+        for raw_line in iter(self._stderr.readline, b""):
+            try:
+                decoded = raw_line.decode("utf-8", errors="replace").rstrip()
+            except Exception:  # pragma: no cover - safety net
+                decoded = str(raw_line)
+            if decoded:
+                self._stderr_tail.append(decoded)
+
+    def close(self) -> None:
+        if self._process.poll() is None:
+            self._process.terminate()
+        try:
+            self._process.wait(timeout=5)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive cleanup
+            self._process.kill()
+        finally:
+            with contextlib.suppress(Exception):
+                self._stdin.close()
+            with contextlib.suppress(Exception):
+                self._stdout.close()
+            if self._stderr is not None:
+                with contextlib.suppress(Exception):
+                    self._stderr.close()
+
+    # ---------------------------------------------------------------- requests
+    def _send_bytes(self, payload: bytes) -> None:
+        header = f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+        self._stdin.write(header + payload)
+        self._stdin.flush()
+
+    def _read_message(self) -> MutableMapping[str, Any]:
+        self._ensure_alive()
+
+        # Read headers until an empty line.
+        header_bytes = bytearray()
+        while True:
+            line = self._stdout.readline()
+            if not line:
+                raise MCPClientError("Unexpected EOF while waiting for MCP response headers.")
+            header_bytes.extend(line)
+            if line in (b"\n", b"\r\n"):
+                break
+
+        header_text = header_bytes.decode("utf-8", errors="replace")
+        content_length = None
+        for raw_header in header_text.splitlines():
+            key, _, value = raw_header.partition(":")
+            if key.lower() == "content-length":
+                try:
+                    content_length = int(value.strip())
+                except ValueError as exc:
+                    raise MCPClientError(f"Invalid Content-Length header: {raw_header!r}") from exc
+                break
+
+        if content_length is None:
+            raise MCPClientError("Missing Content-Length header in MCP response.")
+
+        body = self._stdout.read(content_length)
+        if not body:
+            raise MCPClientError("Failed to read MCP response body.")
+
+        try:
+            decoded = json.loads(body)
+        except json.JSONDecodeError as exc:  # pragma: no cover - protocol corruption
+            raise MCPClientError(f"Malformed MCP JSON payload: {exc}") from exc
+
+        if not isinstance(decoded, MutableMapping):
+            raise MCPClientError(f"Unexpected MCP response type: {type(decoded)!r}")
+
+        return decoded
+
+    def request(self, method: str, params: Mapping[str, Any] | None) -> Any:
+        with self._lock:
+            self._ensure_alive()
+
+            self._next_request_id += 1
+            request_id = self._next_request_id
+            payload = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+            }
+            if params is not None:
+                payload["params"] = params
+
+            self._send_bytes(json.dumps(payload).encode("utf-8"))
+
+            while True:
+                message = self._read_message()
+                if message.get("id") != request_id:
+                    # Ignore notifications and responses to previous requests.
+                    continue
+
+                if "error" in message:
+                    raise MCPClientError(
+                        f"MCP request {method!r} failed: {json.dumps(message['error'], ensure_ascii=False)}"
+                    )
+
+                return message.get("result")
+
+    def notify(self, method: str, params: Mapping[str, Any] | None) -> None:
+        with self._lock:
+            payload = {
+                "jsonrpc": "2.0",
+                "method": method,
+            }
+            if params is not None:
+                payload["params"] = params
+
+            self._send_bytes(json.dumps(payload).encode("utf-8"))
+
+
+class JiraMCPClient:
+    """High-level helper that speaks the MCP JSON-RPC protocol."""
+
+    def __init__(self, spec: MutableMapping[str, Any]) -> None:
+        self.name = str(spec.get("name", DEFAULT_JIRA_NAME))
+        command, args, env = _normalise_spec(spec)
+        self._transport = MCPStdioTransport(command, args, env)
+
+        try:
+            self._transport.request(
+                "initialize",
+                {
+                    "protocolVersion": "0.1",
+                    "clientInfo": {"name": "ag2-example", "version": "1.0"},
+                    "capabilities": {},
+                },
+            )
+            self._transport.notify("initialized", {})
+
+            self._tools = self._collect_tools()
+        except Exception:
+            self._transport.close()
+            raise
+
+    # ----------------------------------------------------------------- helpers
+    def _collect_tools(self) -> list[MutableMapping[str, Any]]:
+        tools: list[MutableMapping[str, Any]] = []
+        cursor = None
+
+        while True:
+            params: dict[str, Any] = {}
+            if cursor is not None:
+                params["cursor"] = cursor
+
+            result = self._transport.request("tools/list", params or None)
+            if isinstance(result, MutableMapping):
+                batch = result.get("tools")
+                if isinstance(batch, list):
+                    tools.extend(item for item in batch if isinstance(item, MutableMapping))
+                cursor = result.get("nextCursor")
+                if cursor is None:
+                    break
+            else:
+                break
+
+        return tools
+
+    # ---------------------------------------------------------------- interface
+    def llm_description(self) -> str:
+        if not self._tools:
+            return (
+                "Call Jira MCP tools by providing a tool name and optional JSON arguments. "
+                "Tool discovery failed so consult server documentation for valid names."
+            )
+
+        lines = []
+        for entry in self._tools:
+            name = str(entry.get("name", "<unnamed>"))
+            description = str(entry.get("description", "")).strip()
+            if description:
+                lines.append(f"- {name}: {description}")
+            else:
+                lines.append(f"- {name}")
+
+        joined = "\n".join(lines)
+        return (
+            "Call Jira MCP tools by providing a tool name and optional JSON arguments. "
+            "Available tools include:\n"
+            + joined
+        )
+
+    def system_suffix(self) -> str:
+        if not self._tools:
+            return (
+                "Use the `jira_call_tool` function when Jira context is required. "
+                "Pass the MCP tool name and JSON arguments expected by the server."
+            )
+
+        tool_names = ", ".join(sorted(str(tool.get("name", "")) for tool in self._tools if tool.get("name")))
+        return (
+            "Use the `jira_call_tool` function to invoke Jira MCP operations. "
+            f"Available tool identifiers: {tool_names}."
+        )
+
+    def call_tool(self, tool_name: str, arguments: Mapping[str, Any] | str | None = None) -> str:
+        payload: dict[str, Any] = {"name": tool_name}
+        if arguments is not None and len(arguments) == 0:
+            arguments = None
+
+        if arguments is not None:
+            if isinstance(arguments, Mapping):
+                payload["arguments"] = dict(arguments)
+            elif isinstance(arguments, str):
+                try:
+                    parsed = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise MCPClientError(f"Failed to parse MCP arguments JSON: {exc}") from exc
+                if not isinstance(parsed, Mapping):
+                    raise MCPClientError("Parsed MCP arguments must be a JSON object.")
+                payload["arguments"] = dict(parsed)
+            else:
+                raise MCPClientError(
+                    "MCP arguments must be provided as a mapping or JSON-encoded string."
+                )
+
+        result = self._transport.request("tools/call", payload)
+        return self._render_result(result)
+
+    def _render_result(self, result: Any) -> str:
+        if isinstance(result, MutableMapping):
+            # Prefer textual outputs when present.
+            outputs = result.get("content") or result.get("outputs")
+            if isinstance(outputs, list):
+                rendered: list[str] = []
+                for item in outputs:
+                    if not isinstance(item, Mapping):
+                        continue
+                    item_type = item.get("type")
+                    if item_type == "text" and "text" in item:
+                        rendered.append(str(item.get("text", "")))
+                    elif item_type == "error":
+                        message = item.get("message") or item.get("text") or item
+                        rendered.append(f"Error: {message}")
+                if rendered:
+                    return "\n".join(rendered)
+
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    def close(self) -> None:
+        self._transport.close()
+
+
+def _normalise_spec(spec: MutableMapping[str, Any]) -> tuple[str, list[str], Mapping[str, str]]:
+    """Extract a stdio transport description from ``spec``."""
+
+    # Direct `command` / `args` layout.
+    if "command" in spec:
+        command = str(spec["command"])
+        args = [str(arg) for arg in spec.get("args", [])]
+        env = spec.get("env") if isinstance(spec.get("env"), Mapping) else {}
+        return command, args, env  # type: ignore[return-value]
+
+    transport = spec.get("transport")
+    if isinstance(transport, MutableMapping):
+        transport_type = transport.get("type") or transport.get("mode")
+        if str(transport_type).lower() != "stdio":
+            raise MCPClientError(
+                "Unsupported MCP transport. Only 'stdio' transports are supported by this example."
+            )
+
+        command = transport.get("command") or transport.get("path") or transport.get("executable")
+        if not command:
+            raise MCPClientError("MCP stdio transport requires a 'command' field.")
+
+        args = transport.get("args") or transport.get("argv") or []
+        env = transport.get("env")
+        if env is not None and not isinstance(env, Mapping):
+            raise MCPClientError("MCP transport 'env' must be a mapping of environment variables.")
+
+        return str(command), [str(arg) for arg in args], env or {}
+
+    raise MCPClientError(
+        "Unsupported MCP spec format. Provide either 'command'/'args' or a 'transport' object with type 'stdio'."
+    )
+
+
+def _build_jira_client(
     env_file: pathlib.Path,
     runtime: str,
     image: str,
     spec_path: pathlib.Path | None,
-) -> MCPToolkit:
-    """Return an MCP toolkit definition that launches the Jira container on demand."""
+) -> JiraMCPClient:
+    """Return an MCP client that can communicate with the Jira server."""
 
     if spec_path is not None:
         spec = _load_tool_spec(spec_path)
         spec.setdefault("name", DEFAULT_JIRA_NAME)
-        return _instantiate_toolkit(spec)
+    else:
+        env_overrides = _load_env_file(env_file)
+        args: list[str] = ["run", "--rm", "-i", "--env-file", str(env_file), image]
+        spec = {
+            "name": DEFAULT_JIRA_NAME,
+            "command": runtime,
+            "args": args,
+            "env": env_overrides,
+        }
 
-    env_overrides = _load_env_file(env_file)
-    args: list[str] = ["run", "--rm", "-i", "--env-file", str(env_file), image]
-
-    spec: MutableMapping[str, Any] = {
-        "name": DEFAULT_JIRA_NAME,
-        "command": runtime,
-        "args": args,
-        "env": env_overrides,
-    }
-
-    return _instantiate_toolkit(spec)
+    return JiraMCPClient(spec)
 
 
 def run_agent(
@@ -186,21 +455,30 @@ def run_agent(
 ) -> None:
     """Send ``prompt`` to the configured AG2 agent and print the response."""
 
+    jira_client = _build_jira_client(jira_env, runtime, image, spec_path)
+
+    system_message = (
+        "You are a concise technical assistant. When possible, respond with bullet points and actionable summaries. "
+        + jira_client.system_suffix()
+    )
+
     agent = ConversableAgent(
         name="assistant",
-        system_message=(
-            "You are a concise technical assistant. When possible, respond with bullet points and actionable summaries."
-        ),
+        system_message=system_message,
         llm_config=_build_llm_config(),
     )
 
-    jira_toolkit = _build_jira_toolkit(jira_env, runtime, image, spec_path)
-    if hasattr(agent, "register_toolkit"):
-        agent.register_toolkit(jira_toolkit)  # type: ignore[attr-defined]
-    else:  # pragma: no cover - fallback for older AG2 builds
-        agent.toolkits = getattr(agent, "toolkits", []) + [jira_toolkit]  # type: ignore[attr-defined]
+    @agent.register_for_llm(name="jira_call_tool", description=jira_client.llm_description())
+    def jira_call_tool(tool_name: str, arguments: Mapping[str, Any] | str | None = None) -> str:
+        try:
+            return jira_client.call_tool(tool_name, arguments)
+        except MCPClientError as exc:
+            return f"Error calling Jira MCP tool '{tool_name}': {exc}"
 
-    response = agent.generate_reply(messages=[{"role": "user", "content": prompt}])
+    try:
+        response = agent.generate_reply(messages=[{"role": "user", "content": prompt}])
+    finally:
+        jira_client.close()
 
     if isinstance(response, dict):
         content = response.get("content")

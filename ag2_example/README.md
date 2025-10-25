@@ -1,10 +1,10 @@
 # AG2 Quickstart Example
 
 This directory contains a lightweight [AG2 (AutoGen)](https://ag2.ai/) example that calls the
-`openai/gpt-oss-120b` chat completion model hosted on the Hugging Face Inference Router and exposes
-the Jira Model Context Protocol (MCP) server as an AG2 toolkit. The entry point lives in
-[`run_example_agent.py`](./run_example_agent.py) and automatically launches the Jira MCP container
-when the agent requests Jira-related context.
+`openai/gpt-oss-120b` chat completion model hosted on the Hugging Face Inference Router and talks to
+the Jira Model Context Protocol (MCP) server through a bespoke JSON-RPC bridge. The entry point
+[`run_example_agent.py`](./run_example_agent.py) automatically launches the Jira MCP container when
+the agent requests Jira-related context.
 
 ## Quickstart
 
@@ -14,9 +14,6 @@ when the agent requests Jira-related context.
    ```bash
    pip install -r requirements.txt
    ```
-
-   Alternatively, installing AG2 from source works as long as the package exposes
-   `ag2.autogen.mcp` so the Jira toolkit can be imported.
 
 3. Export a Hugging Face API token (create one from the
    [Hugging Face settings page](https://huggingface.co/settings/tokens)):
@@ -39,8 +36,8 @@ when the agent requests Jira-related context.
    ```
 
 The script constructs a single `ConversableAgent` with an AutoGen configuration that targets the
-OpenAI-compatible Hugging Face endpoint, registers the Jira MCP toolkit, and prints the model's
-reply to the console.
+OpenAI-compatible Hugging Face endpoint, registers a `jira_call_tool` function backed by the
+JSON-RPC client, and prints the model's reply to the console.
 
 ## Sanity Check
 
@@ -68,7 +65,7 @@ print(response.choices[0].message.content)
 
 * The script defaults to the `podman` runtime. Pass `--jira-runtime docker` if you prefer Docker.
 * If you need to tweak container arguments (for example to mount a certificate bundle), you can
-  edit [`run_example_agent.py`](./run_example_agent.py) and update `_build_jira_toolkit`.
+  edit [`run_example_agent.py`](./run_example_agent.py) and update `_build_jira_client`.
 * To debug the MCP server separately, reuse the command surfaced in
   [`jira.env.example`](./jira.env.example) with
 
@@ -78,8 +75,8 @@ print(response.choices[0].message.content)
 
   Save the inspector's JSON `clientConfig` (or the spec emitted by your existing runtime tooling) to
   a file and pass it to the demo with `--jira-spec path/to/spec.json`. When a spec is supplied the
-  agent skips launching a container and instead connects to the running MCP server described by the
-  JSON payload. The format mirrors the arguments accepted by `_build_jira_toolkit`; for example:
+  agent skips assembling the default container command and instead reuses the JSON payload. The
+  format must describe a `stdio` transport so the script can spawn the process locally; for example:
 
   ```json
   {
@@ -94,6 +91,6 @@ print(response.choices[0].message.content)
   }
   ```
 
-  Specifications exported by other MCP tooling—such as the inspector's WebSocket client config—can
-  be provided verbatim as long as they decode to a JSON object. The loader automatically adapts the
-  payload to the installed AG2/AutoGen MCP API.
+  Specifications exported by other MCP tooling—such as the inspector's WebSocket client config—need
+  to be converted to a stdio command before they can be consumed by this example. The demo focuses on
+  local transports and avoids the `MCPToolkit` dependency entirely.
