@@ -1,11 +1,4 @@
-"""AG2 (AutoGen) example that exposes the Jira MCP server without the MCPToolkit.
-
-The script keeps the lightweight single-file entry point while talking to the Jira
-Model Context Protocol (MCP) server through a tiny JSON-RPC bridge instead of the
-`MCPToolkit` helpers.  The assistant still relies on Hugging Face's
-OpenAI-compatible router and calls the MCP server whenever the conversation
-requires project-tracking context.
-"""
+"""AutoGen example wired for Jira MCP, markitdown, and Docker code execution."""
 
 from __future__ import annotations
 
@@ -16,17 +9,26 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import threading
 from collections import deque
 from typing import Any, Iterable, Mapping, MutableMapping
 
-from autogen import ConversableAgent
+from autogen import AssistantAgent, UserProxyAgent
+from markitdown import MarkItDown
 
 DEFAULT_PROMPT = "Summarise README.md and provide a short bulleted outline."
 DEFAULT_JIRA_IMAGE = "ghcr.io/nguyenvanduocit/jira-mcp:latest"
-DEFAULT_JIRA_RUNTIME = "podman"
+DEFAULT_JIRA_RUNTIME = "docker"
 DEFAULT_JIRA_NAME = "jira"
+DEFAULT_CODE_IMAGE = "python:3.11-slim"
+DEFAULT_CODE_RUNTIME = "docker"
+DEFAULT_MAX_TURNS = 12
 
+
+# ---------------------------------------------------------------------------
+# LLM configuration helpers
+# ---------------------------------------------------------------------------
 
 def _build_llm_config() -> dict[str, Any]:
     """Return the LLM configuration used by the demo agent."""
@@ -45,9 +47,14 @@ def _build_llm_config() -> dict[str, Any]:
                 "api_key": token,
                 "base_url": "https://router.huggingface.co/v1",
             }
-        ]
+        ],
+        "timeout": 120,
     }
 
+
+# ---------------------------------------------------------------------------
+# MCP tooling
+# ---------------------------------------------------------------------------
 
 def _load_env_file(env_file: pathlib.Path) -> Mapping[str, str]:
     """Parse key/value pairs from ``env_file`` while tolerating comments."""
@@ -366,7 +373,6 @@ class JiraMCPClient:
 
     def _render_result(self, result: Any) -> str:
         if isinstance(result, MutableMapping):
-            # Prefer textual outputs when present.
             outputs = result.get("content") or result.get("outputs")
             if isinstance(outputs, list):
                 rendered: list[str] = []
@@ -391,7 +397,6 @@ class JiraMCPClient:
 def _normalise_spec(spec: MutableMapping[str, Any]) -> tuple[str, list[str], Mapping[str, str]]:
     """Extract a stdio transport description from ``spec``."""
 
-    # Direct `command` / `args` layout.
     if "command" in spec:
         command = str(spec["command"])
         args = [str(arg) for arg in spec.get("args", [])]
@@ -446,60 +451,205 @@ def _build_jira_client(
     return JiraMCPClient(spec)
 
 
-def run_agent(
-    prompt: str,
-    jira_env: pathlib.Path,
-    runtime: str,
-    image: str,
-    spec_path: pathlib.Path | None,
-) -> None:
-    """Send ``prompt`` to the configured AG2 agent and print the response."""
+# ---------------------------------------------------------------------------
+# Docker-backed code execution
+# ---------------------------------------------------------------------------
 
-    jira_client = _build_jira_client(jira_env, runtime, image, spec_path)
 
+class DockerExecutionError(RuntimeError):
+    """Raised when docker-backed code execution fails."""
+
+
+class DockerCodeExecutor:
+    """Execute Python code inside an ephemeral container."""
+
+    def __init__(self, runtime: str, image: str, timeout: int = 120) -> None:
+        self.runtime = runtime
+        self.image = image
+        self.timeout = timeout
+
+    def run(self, code: str) -> str:
+        if not code.strip():
+            raise DockerExecutionError("No code supplied for execution.")
+
+        with tempfile.TemporaryDirectory(prefix="autogen-code-") as tmpdir:
+            workdir = pathlib.Path(tmpdir)
+            script_path = workdir / "snippet.py"
+            script_path.write_text(code)
+
+            command = [
+                self.runtime,
+                "run",
+                "--rm",
+                "-v",
+                f"{workdir}:/workspace",
+                "-w",
+                "/workspace",
+                self.image,
+                "python",
+                "snippet.py",
+            ]
+
+            try:
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    check=False,
+                )
+            except FileNotFoundError as exc:
+                raise DockerExecutionError(
+                    f"Failed to launch code execution runtime '{self.runtime}'. Is it installed on the host?"
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise DockerExecutionError(
+                    f"Code execution exceeded the {self.timeout}s timeout."
+                ) from exc
+
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+
+        if completed.returncode != 0:
+            message = f"Execution failed with exit code {completed.returncode}."
+            if stderr:
+                message += f"\nStderr:\n{stderr}"
+            if stdout:
+                message += f"\nStdout:\n{stdout}"
+            raise DockerExecutionError(message)
+
+        if stderr:
+            stdout = f"{stdout}\n[stderr]\n{stderr}" if stdout else f"[stderr]\n{stderr}"
+
+        return stdout or "(no output)"
+
+
+# ---------------------------------------------------------------------------
+# AutoGen chat orchestration
+# ---------------------------------------------------------------------------
+
+
+def _build_agents(
+    jira_client: JiraMCPClient,
+    code_executor: DockerCodeExecutor,
+    max_turns: int,
+) -> tuple[AssistantAgent, UserProxyAgent]:
     system_message = (
         "You are a concise technical assistant. When possible, respond with bullet points and actionable summaries. "
         + jira_client.system_suffix()
+        + " Use markitdown for rich text conversion and the Docker execution tool for prototyping code."
     )
 
-    agent = ConversableAgent(
+    assistant = AssistantAgent(
         name="assistant",
         system_message=system_message,
         llm_config=_build_llm_config(),
+        max_consecutive_auto_reply=max_turns,
     )
 
-    @agent.register_for_llm(name="jira_call_tool", description=jira_client.llm_description())
+    markitdown_converter = MarkItDown()
+
+    @assistant.register_for_llm(name="jira_call_tool", description=jira_client.llm_description())
     def jira_call_tool(tool_name: str, arguments: Mapping[str, Any] | str | None = None) -> str:
         try:
             return jira_client.call_tool(tool_name, arguments)
         except MCPClientError as exc:
             return f"Error calling Jira MCP tool '{tool_name}': {exc}"
 
+    @assistant.register_for_llm(
+        name="render_with_markitdown",
+        description=(
+            "Convert rich content to Markdown. Provide the original content as text and optionally a content_type "
+            "such as 'text/html' or 'text/markdown'."
+        ),
+    )
+    def render_with_markitdown(content: str, content_type: str | None = None) -> str:
+        try:
+            result = markitdown_converter.convert(content, content_type=content_type)
+        except Exception as exc:  # pragma: no cover - library error surface
+            return f"markitdown conversion failed: {exc}"
+
+        if hasattr(result, "markdown"):
+            return str(getattr(result, "markdown"))
+        return str(result)
+
+    @assistant.register_for_llm(
+        name="execute_python", description="Run Python code inside an isolated Docker container and return stdout."
+    )
+    def execute_python(code: str) -> str:
+        try:
+            return code_executor.run(code)
+        except DockerExecutionError as exc:
+            return f"Code execution failed: {exc}"
+
+    user = UserProxyAgent(
+        name="user",
+        human_input_mode="NEVER",
+        max_consecutive_auto_reply=0,
+        is_termination_msg=lambda message: isinstance(message, dict)
+        and isinstance(message.get("content"), str)
+        and message["content"].rstrip().endswith("TERMINATE"),
+    )
+
+    return assistant, user
+
+
+def run_agent(
+    prompt: str,
+    jira_env: pathlib.Path,
+    runtime: str,
+    image: str,
+    spec_path: pathlib.Path | None,
+    code_runtime: str,
+    code_image: str,
+    code_timeout: int,
+    max_turns: int,
+) -> str:
+    jira_client = _build_jira_client(jira_env, runtime, image, spec_path)
+    code_executor = DockerCodeExecutor(code_runtime, code_image, timeout=code_timeout)
+
+    assistant, user = _build_agents(jira_client, code_executor, max_turns)
+
     try:
-        response = agent.generate_reply(messages=[{"role": "user", "content": prompt}])
+        chat_result = user.initiate_chat(assistant, message=prompt, max_turns=max_turns)
     finally:
         jira_client.close()
 
-    if isinstance(response, dict):
-        content = response.get("content")
-        if isinstance(content, list):
-            # Messages can occasionally be returned as a list of chunks.
-            text = "\n".join(chunk.get("text", "") for chunk in content if isinstance(chunk, dict))
-        else:
-            text = str(content)
-    else:
-        text = str(response)
+    history = getattr(chat_result, "chat_history", None)
+    if not history:
+        return ""
 
-    print(text.strip())
+    final_messages = [
+        entry for entry in history if isinstance(entry, dict) and entry.get("role") == assistant.name
+    ]
+    if not final_messages:
+        return ""
+
+    last_message = final_messages[-1].get("content")
+    if isinstance(last_message, list):
+        # Messages can occasionally be returned as a list of content chunks.
+        return "\n".join(
+            chunk.get("text", "") for chunk in last_message if isinstance(chunk, dict)
+        ).strip()
+
+    if isinstance(last_message, str):
+        return last_message.strip()
+
+    return str(last_message)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the lightweight AG2 example agent.")
+    parser = argparse.ArgumentParser(description="Run the AutoGen Jira MCP example agent.")
     parser.add_argument(
         "prompt",
         nargs="?",
         default=DEFAULT_PROMPT,
-        help="User prompt that will be forwarded to the AG2 agent.",
+        help="User prompt that will be forwarded to the agent.",
     )
     parser.add_argument(
         "--jira-env",
@@ -528,6 +678,28 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "server described by the spec instead of spawning the container runtime."
         ),
     )
+    parser.add_argument(
+        "--code-runtime",
+        default=DEFAULT_CODE_RUNTIME,
+        help="Container runtime used for sandboxed code execution (defaults to docker).",
+    )
+    parser.add_argument(
+        "--code-image",
+        default=DEFAULT_CODE_IMAGE,
+        help="Container image that provides the Python runtime for code execution.",
+    )
+    parser.add_argument(
+        "--code-timeout",
+        type=int,
+        default=120,
+        help="Maximum number of seconds to allow a code execution to run before timing out.",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help="Maximum number of automated assistant replies for the conversation.",
+    )
     return parser
 
 
@@ -536,13 +708,27 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        run_agent(args.prompt, args.jira_env, args.jira_runtime, args.jira_image, args.jira_spec)
+        response = run_agent(
+            args.prompt,
+            args.jira_env,
+            args.jira_runtime,
+            args.jira_image,
+            args.jira_spec,
+            args.code_runtime,
+            args.code_image,
+            args.code_timeout,
+            args.max_turns,
+        )
     except Exception as exc:  # noqa: BLE001 - surface rich error message
         parser.error(str(exc))
         return 1
 
+    print(response)
     return 0
 
 
 if __name__ == "__main__":
+    if __package__ is None or __package__ == "":
+        # Allow running as `python ag2_example/run_example_agent.py` without installing the package.
+        sys.path.append(str(pathlib.Path(__file__).resolve().parent.parent))
     sys.exit(main())

@@ -1,48 +1,97 @@
-# AG2 Quickstart Example
+# AutoGen Jira MCP Example
 
-This directory contains a lightweight [AG2 (AutoGen)](https://ag2.ai/) example that calls the
-`openai/gpt-oss-120b` chat completion model hosted on the Hugging Face Inference Router and talks to
-the Jira Model Context Protocol (MCP) server through a bespoke JSON-RPC bridge. The entry point
-[`run_example_agent.py`](./run_example_agent.py) automatically launches the Jira MCP container when
-the agent requests Jira-related context.
+This directory contains an [AutoGen](https://microsoft.github.io/autogen/stable/) sample that wires a
+single assistant agent to three complementary tools:
 
-## Quickstart
+* **Jira MCP** – connect to the Jira Model Context Protocol server over stdio and expose every tool to
+  the language model via a `jira_call_tool` function.
+* **markitdown** – convert rich text (HTML, Markdown, plain text) into Markdown through the Python API.
+* **Docker code execution** – run arbitrary Python snippets in ephemeral containers so the agent can
+  draft, execute, and iterate on code safely.
 
-1. Create and activate a Python 3.11+ virtual environment.
-2. Install the Python dependencies listed in [`requirements.txt`](../requirements.txt):
+The entry point [`run_example_agent.py`](./run_example_agent.py) can either spawn the Jira MCP
+container itself or consume a pre-generated stdio specification. It also registers the markitdown and
+code execution helpers as AutoGen tools, enabling the model to decide when each capability should be
+invoked.
+
+## Prerequisites
+
+* Python 3.11+
+* A working Docker or Podman installation that the agent can reach. Docker is used by default; pass
+  `--jira-runtime podman --code-runtime podman` if you prefer Podman.
+* An environment file that provides Jira credentials for the MCP container. Start with
+  [`jira.env.example`](./jira.env.example).
+* A Hugging Face token with access to the Inference Router saved in `HF_TOKEN`.
+
+## Local quick start
+
+1. Create a virtual environment and install the dependencies from
+   [`requirements.txt`](../requirements.txt):
 
    ```bash
+   python -m venv .venv
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
-3. Export a Hugging Face API token (create one from the
-   [Hugging Face settings page](https://huggingface.co/settings/tokens)):
-
-   ```bash
-   export HF_TOKEN="hf_your_token_here"
-   ```
-
-4. Configure Jira credentials for the MCP container:
+2. Configure Jira credentials for the MCP runtime:
 
    ```bash
    cp ag2_example/jira.env.example ag2_example/.env
    # Populate JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN
    ```
 
-5. Run the example agent and pass an optional prompt:
+3. Export the Hugging Face token that will be used for LLM calls:
 
    ```bash
-   python ag2_example/run_example_agent.py "Summarise README.md and provide a short bulleted outline."
+   export HF_TOKEN="hf_your_token_here"
    ```
 
-The script constructs a single `ConversableAgent` with an AutoGen configuration that targets the
-OpenAI-compatible Hugging Face endpoint, registers a `jira_call_tool` function backed by the
-JSON-RPC client, and prints the model's reply to the console.
+4. Run the demo and optionally override the container runtime or maximum number of automated turns:
 
-## Sanity Check
+   ```bash
+   python ag2_example/run_example_agent.py --max-turns 8 "Summarise README.md in bullet points."
+   ```
 
-If you would like to verify your Hugging Face token separately, you can issue a direct request with
-the OpenAI client included in `requirements.txt`:
+   The assistant will call `jira_call_tool`, `render_with_markitdown`, and `execute_python` as needed
+   during the conversation. Tool responses are streamed back into the chat history so the model can
+   iterate on its plan before producing the final answer.
+
+5. To attach to an already described Jira MCP server, export the inspector's stdio specification to a
+   JSON file and provide it via `--jira-spec path/to/spec.json`. When a spec is supplied the launcher
+   skips assembling the default container command.
+
+## Running inside Docker
+
+A dedicated Dockerfile is provided so the entire stack can run inside a container. Build the image from
+repo root:
+
+```bash
+docker build -f ag2_example/Dockerfile -t ag2-autogen-agent .
+```
+
+Launch the agent by mounting the Jira environment file and exposing your host container runtime. The
+example below assumes Docker; adjust the volume mounts if you rely on Podman or a remote socket:
+
+```bash
+docker run --rm -it \
+  -e HF_TOKEN=$HF_TOKEN \
+  --env-file ag2_example/.env \
+  -v $(pwd)/ag2_example/.env:/app/ag2_example/.env:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  ag2-autogen-agent \
+  --max-turns 8
+```
+
+The container executes `python -m ag2_example.run_example_agent` by default, so any CLI flags can be
+appended directly to the `docker run` command. Mounting the Docker socket gives the in-container agent
+permission to launch additional containers for code execution. If you prefer an alternate runtime,
+bind the appropriate socket and set `--code-runtime` accordingly.
+
+## Hugging Face sanity check
+
+You can validate that your Hugging Face credentials work before running the agent with the bundled
+OpenAI-compatible client:
 
 ```python
 import os
@@ -61,36 +110,11 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-## Jira MCP Notes
+## Jira MCP notes
 
-* The script defaults to the `podman` runtime. Pass `--jira-runtime docker` if you prefer Docker.
-* If you need to tweak container arguments (for example to mount a certificate bundle), you can
-  edit [`run_example_agent.py`](./run_example_agent.py) and update `_build_jira_client`.
-* To debug the MCP server separately, reuse the command surfaced in
-  [`jira.env.example`](./jira.env.example) with
-
-  ```bash
-  npx @modelcontextprotocol/inspector podman run --rm -i --env-file ag2_example/.env ghcr.io/nguyenvanduocit/jira-mcp:latest
-  ```
-
-  Save the inspector's JSON `clientConfig` (or the spec emitted by your existing runtime tooling) to
-  a file and pass it to the demo with `--jira-spec path/to/spec.json`. When a spec is supplied the
-  agent skips assembling the default container command and instead reuses the JSON payload. The
-  format must describe a `stdio` transport so the script can spawn the process locally; for example:
-
-  ```json
-  {
-    "name": "jira",
-    "command": "podman",
-    "args": ["run", "--rm", "-i", "--env-file", "ag2_example/.env", "ghcr.io/nguyenvanduocit/jira-mcp:latest"],
-    "env": {
-      "JIRA_BASE_URL": "https://your-instance.atlassian.net",
-      "JIRA_EMAIL": "you@example.com",
-      "JIRA_API_TOKEN": "your_api_token"
-    }
-  }
-  ```
-
-  Specifications exported by other MCP tooling—such as the inspector's WebSocket client config—need
-  to be converted to a stdio command before they can be consumed by this example. The demo focuses on
-  local transports and avoids the `MCPToolkit` dependency entirely.
+* The default Jira runtime is Docker. Override `--jira-runtime` if you prefer Podman or another
+  container engine.
+* Specifications exported by inspector and other tooling must describe a `stdio` transport so the
+  launcher can spawn the process locally.
+* Tool metadata returned by the `tools/list` RPC is surfaced to the language model inside the system
+  prompt. Ensure your Jira MCP server exposes helpful descriptions to get the best results.

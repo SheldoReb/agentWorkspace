@@ -1,3 +1,4 @@
-# Python dependencies for the AG2 example with Jira MCP tooling (custom client).
+# Python dependencies for the AutoGen Jira MCP example runtime.
 autogen-agentchat>=0.2.0
+markitdown>=0.0.6
 openai>=1.40.0
